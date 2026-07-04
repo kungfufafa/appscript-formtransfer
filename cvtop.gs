@@ -677,20 +677,18 @@ function App() {
 
     const fileItems = payload.linkedFiles.map(file => {
       return `
-      <li style="margin:6px 0">
-        <a href="${escapeHtml(file.url)}" target="_blank" rel="noopener noreferrer">
+      <li style="margin:0 0 4px;padding:0;list-style:none">
+        <a href="${escapeHtml(file.url)}" target="_blank" rel="noopener noreferrer" style="color:#44403c;text-decoration:underline">
           ${escapeHtml(file.name)}
         </a>
-        (${formatBytes(file.size)})
+        <span style="color:#a8a29e;font-size:12px"> · ${formatBytes(file.size)}</span>
       </li>`
     }).join("")
 
     return `
-    <div style="margin-top:20px;padding:14px;border:1px solid #f4b400;border-radius:8px;background:#fff8e1;color:#3c4043;">
-      <strong>Dokumen lampiran</strong>
-      <p style="margin:8px 0">File di bawah tidak dilampirkan langsung ke email (ukuran melebihi batas aman Gmail). Silakan buka melalui Google Drive:</p>
-      <ul style="margin:0;padding-left:20px">${fileItems}</ul>
-      <p style="margin:8px 0 0;font-size:12px;color:#5f6368">Pastikan penerima memiliki izin untuk membuka file.</p>
+    <div style="margin-top:24px;padding-top:16px;border-top:1px solid #e7e5e4;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;color:#44403c">
+      <p style="margin:0 0 10px;font-size:13px;color:#78716c">Lampiran tersedia di Google Drive (ukuran melebihi batas email):</p>
+      <ul style="margin:0;padding:0">${fileItems}</ul>
     </div>`
   }
 
