@@ -1,3 +1,4 @@
+// Define the approval flows in this object
 const FLOWS = {
   defaultFlow: [
     {
@@ -538,7 +539,7 @@ function App() {
 
   this.parsedValues = () => {
     const values = this.sheet.getDataRange().getDisplayValues()
-    const parsedValues = values.map(value => {
+    return values.map(value => {
       return value.map(cell => {
         try {
           return JSON.parse(cell)
@@ -547,7 +548,6 @@ function App() {
         }
       })
     })
-    return parsedValues
   }
 
   this.getTaskById = (id) => {
@@ -617,23 +617,21 @@ function App() {
     props.deleteProperty(this.uidHeader)
   }
 
-  /*
-   * Maksimal total file yang dilampirkan langsung.
-   *
-   * Karena salah satu file Anda sekitar 11 MB, batas 10 MB membuat:
-   * - file 11 MB menjadi link Drive
-   * - file 1 MB tetap dilampirkan
-   */
-  this.emailAttachmentSafeLimitBytes = 10 * 1024 * 1024
+  this.getTaskValue = (task, label, fallback = "") => {
+    if (!Array.isArray(task)) return fallback
+    const item = task.find(entry => entry && entry.label === label)
+    return item && item.value !== undefined && item.value !== null
+      ? item.value
+      : fallback
+  }
 
   /*
-   * Sumber attachment utama: kolom FILE_UPLOAD pada baris/task yang sama.
-   *
-   * Jangan memakai _response_id untuk menentukan attachment email. Apabila
-   * _response_id tertukar, body email tetap benar tetapi file dapat berasal
-   * dari pengajuan lain. Dengan membaca link Drive dari task/baris yang sama,
-   * body dan attachment selalu terikat ke satu record.
+   * Batas attachment Gmail via Apps Script (lebih ketat dari limit Gmail 25 MB).
+   * File/total di atas batas ini TIDAK di-load sebagai blob — hanya link Drive.
    */
+  this.emailAttachmentMaxFileBytes = 5 * 1024 * 1024
+  this.emailAttachmentMaxTotalBytes = 8 * 1024 * 1024
+
   this.getFileUploadTitles = () => {
     if (this._fileUploadTitles) return this._fileUploadTitles
 
@@ -642,9 +640,7 @@ function App() {
         .getItems(FormApp.ItemType.FILE_UPLOAD)
         .map(item => item.getTitle())
     } catch (error) {
-      console.error(
-        `Gagal membaca judul FILE_UPLOAD dari Form: ${error.message}`
-      )
+      console.error(`Gagal membaca judul FILE_UPLOAD dari Form: ${error.message}`)
       this._fileUploadTitles = []
     }
 
@@ -654,10 +650,7 @@ function App() {
   this.extractDriveFileIds = value => {
     if (value == null || value === "") return []
 
-    const text = Array.isArray(value)
-      ? value.join("\n")
-      : String(value)
-
+    const text = Array.isArray(value) ? value.join("\n") : String(value)
     const ids = []
     const seen = {}
 
@@ -668,24 +661,20 @@ function App() {
       ids.push(id)
     }
 
-    /* https://drive.google.com/open?id=FILE_ID atau ?id=FILE_ID */
     let match
     const queryIdPattern = /[?&]id=([A-Za-z0-9_-]{20,})/g
     while ((match = queryIdPattern.exec(text)) !== null) add(match[1])
 
-    /* https://drive.google.com/file/d/FILE_ID/view */
     const pathIdPattern = /\/d\/([A-Za-z0-9_-]{20,})/g
     while ((match = pathIdPattern.exec(text)) !== null) add(match[1])
 
-    /* Nilai FILE_UPLOAD dari Form kadang langsung berupa ID. */
-    const directParts = text
+    String(text)
       .split(/[\s,;]+/)
       .map(part => part.trim())
       .filter(Boolean)
-
-    directParts.forEach(part => {
-      if (/^[A-Za-z0-9_-]{20,}$/.test(part)) add(part)
-    })
+      .forEach(part => {
+        if (/^[A-Za-z0-9_-]{20,}$/.test(part)) add(part)
+      })
 
     return ids
   }
@@ -712,11 +701,6 @@ function App() {
       })
     })
 
-    /*
-     * Fallback untuk form lama atau judul item yang pernah diganti. Hanya
-     * kolom yang terlihat seperti kolom lampiran dan berisi URL Drive yang
-     * dipindai. Tetap berasal dari task/baris yang sama.
-     */
     if (!fileIds.length) {
       task.forEach(field => {
         if (!field) return
@@ -743,24 +727,33 @@ function App() {
     fileIds.forEach(fileId => {
       try {
         const file = DriveApp.getFileById(fileId)
-        const blob = file.getBlob().setName(file.getName())
 
         entries.push({
           id: fileId,
           name: file.getName(),
           size: file.getSize(),
           url: file.getUrl(),
-          blob: blob,
           source: "sheet_row"
         })
       } catch (error) {
-        console.error(
-          `Gagal membaca file dari baris/task ${fileId}: ${error.message}`
-        )
+        console.error(`Gagal membaca metadata file ${fileId}: ${error.message}`)
       }
     })
 
     return entries
+  }
+
+  this.loadAttachmentBlob = entry => {
+    if (!entry || entry.blob) return entry.blob
+
+    try {
+      const file = DriveApp.getFileById(entry.id)
+      entry.blob = file.getBlob().setName(file.getName())
+      return entry.blob
+    } catch (error) {
+      console.error(`Gagal load blob ${entry.id}: ${error.message}`)
+      return null
+    }
   }
 
   this.prepareEmailAttachmentsFromEntries = entries => {
@@ -768,23 +761,27 @@ function App() {
 
     const attachments = []
     const linkedFiles = []
-
     let attachedBytes = 0
     let totalBytes = 0
 
     entries.forEach(entry => {
-      totalBytes += entry.size
+      totalBytes += entry.size || 0
 
-      const canAttach =
-        entry.size <= this.emailAttachmentSafeLimitBytes &&
-        attachedBytes + entry.size <= this.emailAttachmentSafeLimitBytes
+      const withinFileLimit = entry.size <= this.emailAttachmentMaxFileBytes
+      const withinTotalLimit =
+        attachedBytes + entry.size <= this.emailAttachmentMaxTotalBytes
+      const canAttach = withinFileLimit && withinTotalLimit
 
       if (canAttach) {
-        attachments.push(entry.blob)
-        attachedBytes += entry.size
-      } else {
-        linkedFiles.push(entry)
+        const blob = this.loadAttachmentBlob(entry)
+        if (blob) {
+          attachments.push(blob)
+          attachedBytes += entry.size
+          return
+        }
       }
+
+      linkedFiles.push(entry)
     })
 
     return {
@@ -794,20 +791,18 @@ function App() {
       attachedBytes,
       totalBytes,
       totalFiles: entries.length,
-      attachmentSource: "sheet_row_file_upload_columns"
+      attachmentSource: "sheet_row_file_upload_columns",
+      usedLinkFallback: linkedFiles.length > 0
     }
   }
 
   this.prepareEmailAttachmentsFromTask = task => {
-    const entries = this.getAttachmentEntriesFromTask(task)
-    return this.prepareEmailAttachmentsFromEntries(entries)
+    return this.prepareEmailAttachmentsFromEntries(
+      this.getAttachmentEntriesFromTask(task)
+    )
   }
 
-  /*
-   * Fungsi berbasis responseId dipertahankan hanya untuk audit/repair lama.
-   * Fungsi kirim email TIDAK BOLEH menggunakan fungsi ini lagi.
-   */
-  this.getAttachmentEntriesByResponseId = (responseId) => {
+  this.getAttachmentEntriesByResponseId = responseId => {
     if (!responseId) return []
 
     try {
@@ -824,9 +819,7 @@ function App() {
         if (item.getType() !== FormApp.ItemType.FILE_UPLOAD) return
 
         const fileIds = itemResponse.getResponse()
-        const ids = Array.isArray(fileIds)
-          ? fileIds
-          : (fileIds ? [fileIds] : [])
+        const ids = Array.isArray(fileIds) ? fileIds : (fileIds ? [fileIds] : [])
 
         ids.forEach(fileId => {
           try {
@@ -840,40 +833,20 @@ function App() {
               source: "form_response_audit_only"
             })
           } catch (error) {
-            console.error(
-              `Failed to read uploaded file ${fileId}: ${error.message}`
-            )
+            console.error(`Failed to read uploaded file ${fileId}: ${error.message}`)
           }
         })
       })
 
       return entries
     } catch (error) {
-      console.error(
-        `Failed to get attachments for response ${responseId}: ${error.message}`
-      )
+      console.error(`Failed to get attachments for response ${responseId}: ${error.message}`)
       return []
     }
   }
 
-  this.getAttachmentsByResponseId = responseId => {
-    return this
-      .getAttachmentEntriesByResponseId(responseId)
-      .map(entry => entry.blob)
-  }
-
-  this.prepareEmailAttachmentsByResponseId = responseId => {
-    return this.prepareEmailAttachmentsFromEntries(
-      this.getAttachmentEntriesByResponseId(responseId)
-    )
-  }
-
-  this.buildLargeAttachmentNoticeHtml = (payload) => {
-    if (
-      !payload ||
-      !payload.linkedFiles ||
-      !payload.linkedFiles.length
-    ) {
+  this.buildLargeAttachmentNoticeHtml = payload => {
+    if (!payload || !payload.linkedFiles || !payload.linkedFiles.length) {
       return ""
     }
 
@@ -886,50 +859,48 @@ function App() {
 
     const formatBytes = bytes => {
       if (!bytes) return "0 B"
-
       return (bytes / 1024 / 1024).toFixed(2) + " MB"
     }
 
     const fileItems = payload.linkedFiles.map(file => {
       return `
       <li style="margin:6px 0">
-        <a
-          href="${escapeHtml(file.url)}"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
+        <a href="${escapeHtml(file.url)}" target="_blank" rel="noopener noreferrer">
           ${escapeHtml(file.name)}
         </a>
         (${formatBytes(file.size)})
-      </li>
-    `
+      </li>`
     }).join("")
 
     return `
-    <div style="
-      margin-top:20px;
-      padding:14px;
-      border:1px solid #f4b400;
-      border-radius:8px;
-      background:#fff8e1;
-      color:#3c4043;
-    ">
+    <div style="margin-top:20px;padding:14px;border:1px solid #f4b400;border-radius:8px;background:#fff8e1;color:#3c4043;">
       <strong>Dokumen lampiran</strong>
+      <p style="margin:8px 0">File di bawah tidak dilampirkan langsung ke email (ukuran melebihi batas aman Gmail). Silakan buka melalui Google Drive:</p>
+      <ul style="margin:0;padding-left:20px">${fileItems}</ul>
+      <p style="margin:8px 0 0;font-size:12px;color:#5f6368">Pastikan penerima memiliki izin untuk membuka file.</p>
+    </div>`
+  }
 
-      <p style="margin:8px 0">
-        Sebagian file tidak dilampirkan langsung karena ukurannya besar.
-        Silakan buka melalui Google Drive:
-      </p>
+  this.sendEmailLinksOnly = (recipient, subject, baseHtmlBody, attachmentPayload) => {
+    const linksOnlyPayload = Object.assign({}, attachmentPayload, {
+      attachments: [],
+      linkedFiles: attachmentPayload.allFiles
+    })
 
-      <ul style="margin:0;padding-left:20px">
-        ${fileItems}
-      </ul>
+    GmailApp.sendEmail(recipient, subject, "", {
+      htmlBody: baseHtmlBody + this.buildLargeAttachmentNoticeHtml(linksOnlyPayload)
+    })
 
-      <p style="margin:8px 0 0;font-size:12px;color:#5f6368">
-        Pastikan penerima memiliki izin untuk membuka file.
-      </p>
-    </div>
-  `
+    return {
+      attachedFiles: 0,
+      linkedFiles: linksOnlyPayload.linkedFiles.length,
+      totalFiles: attachmentPayload.totalFiles,
+      totalBytes: attachmentPayload.totalBytes,
+      fileNames: attachmentPayload.allFiles.map(file => file.name),
+      fileIds: attachmentPayload.allFiles.map(file => file.id),
+      attachmentSource: attachmentPayload.attachmentSource,
+      fallbackToLinks: true
+    }
   }
 
   this.sendEmailWithAttachmentFallback = ({
@@ -938,25 +909,30 @@ function App() {
     baseHtmlBody,
     attachmentPayload
   }) => {
-    const htmlBody =
-      baseHtmlBody +
-      this.buildLargeAttachmentNoticeHtml(attachmentPayload)
+    const hasInlineAttachments = attachmentPayload.attachments.length > 0
 
-    const options = {
-      htmlBody: htmlBody
-    }
+    if (!hasInlineAttachments) {
+      GmailApp.sendEmail(recipient, subject, "", {
+        htmlBody: baseHtmlBody + this.buildLargeAttachmentNoticeHtml(attachmentPayload)
+      })
 
-    if (attachmentPayload.attachments.length) {
-      options.attachments = attachmentPayload.attachments
+      return {
+        attachedFiles: 0,
+        linkedFiles: attachmentPayload.linkedFiles.length,
+        totalFiles: attachmentPayload.totalFiles,
+        totalBytes: attachmentPayload.totalBytes,
+        fileNames: attachmentPayload.allFiles.map(file => file.name),
+        fileIds: attachmentPayload.allFiles.map(file => file.id),
+        attachmentSource: attachmentPayload.attachmentSource,
+        fallbackToLinks: attachmentPayload.usedLinkFallback
+      }
     }
 
     try {
-      GmailApp.sendEmail(
-        recipient,
-        subject,
-        "",
-        options
-      )
+      GmailApp.sendEmail(recipient, subject, "", {
+        htmlBody: baseHtmlBody + this.buildLargeAttachmentNoticeHtml(attachmentPayload),
+        attachments: attachmentPayload.attachments
+      })
 
       return {
         attachedFiles: attachmentPayload.attachments.length,
@@ -969,88 +945,62 @@ function App() {
         fallbackToLinks: false
       }
     } catch (error) {
-      const message = error && error.message
-        ? error.message
-        : String(error)
+      const message = error && error.message ? error.message : String(error)
 
-      const isAttachmentLimitError =
-        /Email Total Attachments Size|Email Attachments Per Message|Limit Exceeded.*Attachment/i
-          .test(message)
-
-      /*
-       * Error selain batas attachment tetap dilempar,
-       * misalnya email tidak valid atau kuota pengiriman habis.
-       */
-      if (
-        !attachmentPayload.attachments.length ||
-        !isAttachmentLimitError
-      ) {
-        throw error
-      }
-
-      console.warn(
-        `Attachment ditolak untuk ${recipient}. ` +
-        `Email dikirim ulang menggunakan link Drive.`
+      Logger.log(
+        `Kirim email dengan attachment gagal ke ${recipient}: ${message}. ` +
+        "Mencoba ulang hanya dengan link Drive."
       )
 
-      const linksOnlyPayload = Object.assign(
-        {},
-        attachmentPayload,
-        {
-          attachments: [],
-          linkedFiles: attachmentPayload.allFiles
+      try {
+        return this.sendEmailLinksOnly(recipient, subject, baseHtmlBody, attachmentPayload)
+      } catch (retryError) {
+        const retryMessage =
+          retryError && retryError.message ? retryError.message : String(retryError)
+
+        Logger.log(
+          `Kirim email link-only juga gagal ke ${recipient}: ${retryMessage}. ` +
+          "Mencoba kirim tanpa info lampiran."
+        )
+
+        GmailApp.sendEmail(recipient, subject, "", { htmlBody: baseHtmlBody })
+
+        return {
+          attachedFiles: 0,
+          linkedFiles: 0,
+          totalFiles: attachmentPayload.totalFiles,
+          totalBytes: attachmentPayload.totalBytes,
+          fileNames: attachmentPayload.allFiles.map(file => file.name),
+          fileIds: attachmentPayload.allFiles.map(file => file.id),
+          attachmentSource: attachmentPayload.attachmentSource,
+          fallbackToLinks: true,
+          emailSentWithoutAttachmentInfo: true
         }
-      )
-
-      GmailApp.sendEmail(
-        recipient,
-        subject,
-        "",
-        {
-          htmlBody:
-            baseHtmlBody +
-            this.buildLargeAttachmentNoticeHtml(linksOnlyPayload)
-        }
-      )
-
-      return {
-        attachedFiles: 0,
-        linkedFiles: linksOnlyPayload.linkedFiles.length,
-        totalFiles: attachmentPayload.totalFiles,
-        totalBytes: attachmentPayload.totalBytes,
-        fileNames: attachmentPayload.allFiles.map(file => file.name),
-        fileIds: attachmentPayload.allFiles.map(file => file.id),
-        attachmentSource: attachmentPayload.attachmentSource,
-        fallbackToLinks: true
       }
     }
   }
 
-  this.sendApproval = ({
-    task,
-    approver,
-    approvers,
-    responseId
-  }) => {
-    const template =
-      HtmlService.createTemplateFromFile("approval_email.html")
+  this.sendApprovalEmail = ({ task, approver, approvers }) => {
+    if (!approver || !approver.email) {
+      throw new Error("Data approver atau email approver tidak valid.")
+    }
 
+    Logger.log("Mengirim approval email ke: " + approver.email)
+
+    const template = HtmlService.createTemplateFromFile("approval_email.html")
     template.title = this.title
     template.task = task
     template.approver = approver
     template.approvers = approvers
     template.actionUrl = `${this.url}?taskId=${approver.taskId}`
     template.formUrl = this.formUrl
-
     template.approved = this.approved
     template.rejected = this.rejected
     template.pending = this.pending
     template.waiting = this.waiting
 
     const subject = "Approval Required - " + this.title
-
-    const attachmentPayload =
-      this.prepareEmailAttachmentsFromTask(task)
+    const attachmentPayload = this.prepareEmailAttachmentsFromTask(task)
 
     return this.sendEmailWithAttachmentFallback({
       recipient: approver.email,
@@ -1060,41 +1010,87 @@ function App() {
     })
   }
 
-  this.sendNotification = (taskId) => {
-    const {
-      email,
-      responseId,
-      status,
-      task,
-      approvers
-    } = this.getTaskById(taskId)
+  this.buildWhatsAppMessage = (task, approver) => {
+    const uid = this.getTaskValue(task, "_uid", "-")
+    const emailAddr = this.getTaskValue(task, "Email Address", "-")
+    const name = this.getTaskValue(task, "Nama", "-")
+    const division = this.getTaskValue(task, "Divisi", "-")
+    const rekening = this.getTaskValue(task, "Nomer Rekening", "-")
+    const rekeningOwner = this.getTaskValue(task, "Nama Pemilik Rekening", "-")
+    const bank = this.getTaskValue(task, "Bank", "-")
+    const transferAmount = this.getTaskValue(task, "Jumlah Transfer", "-")
+    const purpose = this.getTaskValue(task, "Keperluan", "-")
+    const reffnote = this.getTaskValue(task, "Reffnote", "-")
+    const statusTransfer = this.getTaskValue(task, "Status Transfer", "-")
+    const attacmentInvoice = this.getTaskValue(task, "Lampiran Invoice (Jika ada)", "Tidak ada")
 
-    if (!email) {
-      throw new Error(
-        "Email pengaju tidak ditemukan untuk taskId: " + taskId
-      )
+    return (
+      `*📣 NOTIFIKASI APPROVAL - ${this.title}*\n\n` +
+      `*UID:* ${uid}\n` +
+      `*Email:* ${emailAddr}\n` +
+      `*Nama:* ${name}\n` +
+      `*Divisi:* ${division}\n\n` +
+      `*Nomor Rekening:* ${rekening}\n` +
+      `*Nama Pemilik Rekening:* ${rekeningOwner}\n` +
+      `*Bank:* ${bank}\n` +
+      `*Jumlah Transfer:* ${transferAmount}\n` +
+      `*Keperluan:* ${purpose}\n` +
+      `*Reffnote:* ${reffnote}\n` +
+      `*Lampiran Invoice (Jika ada):* ${attacmentInvoice || "Tidak ada"}\n` +
+      `*Status Transfer:* ${statusTransfer}\n\n` +
+      `*Klik link berikut untuk Approve atau Reject:*\n` +
+      `${this.url}?taskId=${approver.taskId}&action=approve\n\n` +
+      `— *Bot by IT*`
+    )
+  }
+
+  this.sendWhatsAppToApprover = (task, approver) => {
+    if (!approver) {
+      return { ok: false, skipped: true, reason: "approver_missing" }
     }
 
-    const template =
-      HtmlService.createTemplateFromFile("notification_email.html")
+    const phone = normalizePhoneForWhatsApp(approver.phone)
+    if (!phone) {
+      Logger.log(
+        `[WhatsApp SKIP] Nomor tidak valid untuk approver: ${approver.name || "-"} ` +
+        `(phone=${approver.phone || "-"})`
+      )
+      return { ok: false, skipped: true, reason: "invalid_phone" }
+    }
 
+    const message = this.buildWhatsAppMessage(task, approver)
+    return sendWhatsApp(phone, message)
+  }
+
+  this.sendApproval = ({ task, approver, approvers }) => {
+    const emailResult = this.sendApprovalEmail({ task, approver, approvers })
+    const whatsappResult = this.sendWhatsAppToApprover(task, approver)
+    return { email: emailResult, whatsapp: whatsappResult }
+  }
+
+  this.sendNotification = taskId => {
+    const { email, responseId, status, task, approvers } = this.getTaskById(taskId)
+
+    if (!email) {
+      throw new Error("Email pengaju tidak ditemukan untuk taskId: " + taskId)
+    }
+
+    Logger.log(`Mengirim notifikasi pengaju ke ${email}; taskId=${taskId}; responseId=${responseId}`)
+
+    const template = HtmlService.createTemplateFromFile("notification_email.html")
     template.title = this.title
     template.task = task
     template.status = status
     template.approvers = approvers
     template.formUrl = this.formUrl
-    template.approvalProgressUrl =
-      `${this.url}?responseId=${responseId}`
-
+    template.approvalProgressUrl = `${this.url}?responseId=${responseId}`
     template.approved = this.approved
     template.rejected = this.rejected
     template.pending = this.pending
     template.waiting = this.waiting
 
     const subject = `Approval ${status} - ${this.title}`
-
-    const attachmentPayload =
-      this.prepareEmailAttachmentsFromTask(task)
+    const attachmentPayload = this.prepareEmailAttachmentsFromTask(task)
 
     return this.sendEmailWithAttachmentFallback({
       recipient: email,
@@ -1105,10 +1101,192 @@ function App() {
   }
 
   /*
-   * Normalisasi nilai untuk mencocokkan event Form dengan baris Spreadsheet.
-   * File upload sengaja tidak dipakai sebagai pembanding karena Form memberi ID,
-   * sedangkan Spreadsheet menampilkan URL Drive.
+   * Satu pintu kirim email — trigger, approve, reject, dan resend
+   * memakai fungsi dispatch yang sama agar format & urutan konsisten.
    */
+  this.safeEmailDispatch = (label, fn) => {
+    try {
+      const result = fn()
+      Logger.log(`[EMAIL OK] ${label}`)
+      return { ok: true, label: label, result: result }
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error)
+      Logger.log(`[EMAIL FAIL] ${label}: ${message}`)
+      return { ok: false, label: label, error: message }
+    }
+  }
+
+  this.safeWhatsAppDispatch = (label, fn) => {
+    try {
+      const result = fn()
+      if (result && result.skipped) {
+        Logger.log(`[WA SKIP] ${label}: ${result.reason || "skipped"}`)
+        return { ok: false, label: label, skipped: true, reason: result.reason }
+      }
+      if (result && result.ok === false) {
+        Logger.log(`[WA FAIL] ${label}: ${result.error || "unknown"}`)
+        return { ok: false, label: label, error: result.error || "unknown" }
+      }
+      Logger.log(`[WA OK] ${label}`)
+      return { ok: true, label: label, result: result }
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error)
+      Logger.log(`[WA FAIL] ${label}: ${message}`)
+      return { ok: false, label: label, error: message }
+    }
+  }
+
+  this.buildEmailDispatchSummary = (uid, phase, results) => {
+    const summary = {
+      uid: uid,
+      phase: phase,
+      sent: results.filter(item => item.ok).map(item => item.label),
+      skipped: results.filter(item => item.skipped).map(item => ({
+        step: item.label,
+        reason: item.reason
+      })),
+      failed: results.filter(item => !item.ok && !item.skipped).map(item => ({
+        step: item.label,
+        error: item.error
+      }))
+    }
+
+    Logger.log(JSON.stringify(summary, null, 2))
+    return summary
+  }
+
+  this.dispatchApproverNotifications = ({ task, approver, approvers, phaseLabel }) => {
+    const approverLabel = approver.name || approver.email || "-"
+
+    return [
+      this.safeEmailDispatch(
+        `Approval email ke ${approver.email} (${phaseLabel})`,
+        () => this.sendApprovalEmail({ task, approver, approvers })
+      ),
+      this.safeWhatsAppDispatch(
+        `WhatsApp ke ${approverLabel} (${phaseLabel})`,
+        () => this.sendWhatsAppToApprover(task, approver)
+      )
+    ]
+  }
+
+  // Trigger awal: notifikasi pengaju + approval ke approver pending pertama.
+  this.dispatchEmailsAfterSubmit = taskId => {
+    const { task, approver, approvers } = this.getTaskById(taskId)
+
+    if (!approver || !approver.email) {
+      throw new Error(`Tidak ada approver pending untuk taskId ${taskId}`)
+    }
+
+    const results = [
+      this.safeEmailDispatch(
+        `Notifikasi pengaju (submit) taskId=${taskId}`,
+        () => this.sendNotification(taskId)
+      )
+    ].concat(
+      this.dispatchApproverNotifications({
+        task,
+        approver,
+        approvers,
+        phaseLabel: "submit"
+      })
+    )
+
+    return this.buildEmailDispatchSummary(null, "after_submit", results)
+  }
+
+  // Setelah approve lanjut: update pengaju + approval ke approver berikutnya.
+  this.dispatchEmailsAfterApproveAdvance = ({
+    taskId,
+    task,
+    nextApprover,
+    approvers
+  }) => {
+    if (!nextApprover || !nextApprover.email) {
+      throw new Error(`Approver berikutnya tidak valid untuk taskId ${taskId}`)
+    }
+
+    const results = [
+      this.safeEmailDispatch(
+        `Notifikasi pengaju (progress) taskId=${taskId}`,
+        () => this.sendNotification(taskId)
+      )
+    ].concat(
+      this.dispatchApproverNotifications({
+        task,
+        approver: nextApprover,
+        approvers,
+        phaseLabel: "level berikutnya"
+      })
+    )
+
+    return this.buildEmailDispatchSummary(null, "after_approve_advance", results)
+  }
+
+  // Setelah approve final / reject: hanya update pengaju.
+  this.dispatchEmailsAfterComplete = (taskId, phase) => {
+    const results = [
+      this.safeEmailDispatch(
+        `Notifikasi pengaju (${phase}) taskId=${taskId}`,
+        () => this.sendNotification(taskId)
+      )
+    ]
+
+    return this.buildEmailDispatchSummary(null, phase, results)
+  }
+
+  this.resolveTaskIdForUid = uidData => {
+    if (uidData.approver && uidData.approver.taskId) {
+      return uidData.approver.taskId
+    }
+
+    if (uidData.approvers && uidData.approvers.length) {
+      const pending = uidData.approvers.find(item => item.status === this.pending)
+      if (pending && pending.taskId) return pending.taskId
+
+      const last = uidData.approvers[uidData.approvers.length - 1]
+      if (last && last.taskId) return last.taskId
+    }
+
+    throw new Error(`TaskId tidak ditemukan untuk UID ${uidData.uid}`)
+  }
+
+  /*
+   * Resend konsisten dengan fase dokumen saat ini:
+   * - Pending  → sama seperti trigger (pengaju + approver pending)
+   * - Approved/Rejected → sama seperti approve final/reject (pengaju saja)
+   */
+  this.resendEmailsByUid = uid => {
+    const uidData = this.getTaskByUid(uid)
+    const { status } = uidData
+
+    if (status === this.pending) {
+      const taskId = this.resolveTaskIdForUid(uidData)
+      const summary = this.dispatchEmailsAfterSubmit(taskId)
+      summary.uid = uid
+      summary.phase = "resend_pending"
+      Logger.log(JSON.stringify(summary, null, 2))
+      return summary
+    }
+
+    if (status === this.approved || status === this.rejected) {
+      const taskId = this.resolveTaskIdForUid(uidData)
+      const phase = status === this.approved ? "resend_approved" : "resend_rejected"
+      const summary = this.dispatchEmailsAfterComplete(taskId, phase)
+      summary.uid = uid
+      Logger.log(JSON.stringify(summary, null, 2))
+      return summary
+    }
+
+    throw new Error(
+      `UID ${uid} tidak bisa di-resend. Status tidak dikenal: ${status}`
+    )
+  }
+
+  this.resendPendingApprovalByUid = uid => {
+    return this.resendEmailsByUid(uid)
+  }
+
   this.normalizeResponseMatchValue = value => {
     if (value == null) return ""
 
@@ -1124,11 +1302,6 @@ function App() {
       .toLowerCase()
   }
 
-  /*
-   * Temukan baris Spreadsheet yang benar-benar berasal dari e.response.
-   * Jangan pernah memakai getResponses()[terakhir] + baris terakhir karena
-   * dua submit yang berdekatan dapat membuat responseId dan data tertukar.
-   */
   this.findSheetRowForResponse = response => {
     if (!response) {
       throw new Error("Event Form tidak memiliki e.response.")
@@ -1140,20 +1313,12 @@ function App() {
     )
 
     const responseItems = response.getItemResponses()
-      .filter(itemResponse => {
-        return itemResponse.getItem().getType() !== FormApp.ItemType.FILE_UPLOAD
-      })
-      .map(itemResponse => {
-        return {
-          title: itemResponse.getItem().getTitle(),
-          value: this.normalizeResponseMatchValue(itemResponse.getResponse())
-        }
-      })
+      .filter(itemResponse => itemResponse.getItem().getType() !== FormApp.ItemType.FILE_UPLOAD)
+      .map(itemResponse => ({
+        title: itemResponse.getItem().getTitle(),
+        value: this.normalizeResponseMatchValue(itemResponse.getResponse())
+      }))
 
-    /*
-     * Kadang event Form berjalan sangat cepat sebelum row selesai terlihat
-     * pada Spreadsheet. Coba beberapa kali dalam waktu singkat.
-     */
     for (let attempt = 0; attempt < 10; attempt++) {
       SpreadsheetApp.flush()
 
@@ -1179,15 +1344,10 @@ function App() {
           : new Date(rawTimestamp).getTime()
 
         if (!Number.isFinite(rowTimestamp)) continue
-
-        /* Spreadsheet umumnya menyimpan timestamp sampai detik. */
         if (Math.abs(rowTimestamp - responseTimestamp) > 2000) continue
 
         if (respondentEmail && emailColumn >= 0) {
-          const rowEmail = this.normalizeResponseMatchValue(
-            displayValues[rowIndex][emailColumn]
-          )
-
+          const rowEmail = this.normalizeResponseMatchValue(displayValues[rowIndex][emailColumn])
           if (rowEmail !== respondentEmail) continue
         }
 
@@ -1197,31 +1357,25 @@ function App() {
           const columnIndex = headers.indexOf(responseItem.title)
           if (columnIndex === -1) return
 
-          const rowValue = this.normalizeResponseMatchValue(
-            displayValues[rowIndex][columnIndex]
-          )
-
+          const rowValue = this.normalizeResponseMatchValue(displayValues[rowIndex][columnIndex])
           if (rowValue === responseItem.value) score++
         })
 
         if (score > bestScore) {
           bestScore = score
-          bestRow = rowIndex + 1 // Spreadsheet row is 1-based.
+          bestRow = rowIndex + 1
         }
       }
 
       if (bestRow) return bestRow
-
       Utilities.sleep(500)
     }
 
     throw new Error(
-      "Baris Spreadsheet untuk Form Response " + response.getId() +
-      " tidak ditemukan."
+      "Baris Spreadsheet untuk Form Response " + response.getId() + " tidak ditemukan."
     )
   }
 
-  // Tambahkan metadata approval ke response yang benar-benar memicu event.
   this.onFormSubmit = e => {
     if (!e || !e.response) {
       throw new Error(
@@ -1233,43 +1387,44 @@ function App() {
     const submittedResponse = e.response
     const responseId = submittedResponse.getId()
     const lock = LockService.getDocumentLock()
-
     let taskId
 
     lock.waitLock(30000)
 
     try {
       const submittedRow = this.findSheetRowForResponse(submittedResponse)
+      const data = this.sheet.getDataRange().getValues()
       const values = this.parsedValues()
       const headers = values[0]
+
+      const uidColumn = headers.indexOf(this.uidHeader)
+      const existingResponseIdColumn = headers.indexOf(this.responseIdHeader)
+
+      if (uidColumn >= 0 && existingResponseIdColumn >= 0) {
+        const existingUid = String(data[submittedRow - 1][uidColumn] || "").trim()
+        const existingResponseId = String(data[submittedRow - 1][existingResponseIdColumn] || "").trim()
+
+        if (existingUid && existingResponseId === responseId) {
+          Logger.log(
+            `Response ${responseId} sudah diproses sebagai ${existingUid}. Trigger duplikat diabaikan.`
+          )
+          return
+        }
+      }
 
       let startColumn = headers.indexOf(this.uidHeader) + 1
       if (startColumn === 0) startColumn = headers.length + 1
 
       const flowColumn = headers.indexOf(this.flowHeader)
       if (flowColumn === -1) {
-        throw new Error(
-          'Kolom flow "' + this.flowHeader + '" tidak ditemukan.'
-        )
+        throw new Error('Kolom flow "' + this.flowHeader + '" tidak ditemukan.')
       }
 
       const flowKey = values[submittedRow - 1][flowColumn]
+      const flow = (FLOWS[flowKey] || FLOWS.defaultFlow).map(item => Object.assign({}, item))
 
-      /* Clone supaya object di FLOWS tidak dimutasi antar-submit. */
-      const flow = (FLOWS[flowKey] || FLOWS.defaultFlow)
-        .map(item => Object.assign({}, item))
-
-      const newHeaders = [
-        this.uidHeader,
-        this.statusHeader,
-        this.responseIdHeader
-      ]
-
-      const newValues = [
-        this.createUid(),
-        this.pending,
-        responseId
-      ]
+      const newHeaders = [this.uidHeader, this.statusHeader, this.responseIdHeader]
+      const newValues = [this.createUid(), this.pending, responseId]
 
       flow.forEach((item, i) => {
         newHeaders.push("_approver_" + (i + 1))
@@ -1295,25 +1450,56 @@ function App() {
         .setValues([newValues])
 
       SpreadsheetApp.flush()
+
+      Logger.log(
+        `Pengajuan diproses: row=${submittedRow}, responseId=${responseId}, uid=${newValues[0]}, flow=${flowKey}`
+      )
     } finally {
       lock.releaseLock()
     }
 
-    /* Email dikirim setelah lock dilepas agar submit lain tidak tertahan lama. */
-    this.sendNotification(taskId)
+    this.dispatchEmailsAfterSubmit(taskId)
+  }
 
-    const { task, approver, approvers } = this.getTaskById(taskId)
+  this.getTaskByUid = uid => {
+    const values = this.parsedValues()
+    const headers = values[0]
 
-    this.sendApproval({
-      task,
-      approver,
-      approvers,
-      responseId
+    const uidIndex = headers.indexOf(this.uidHeader)
+    const statusIndex = headers.indexOf(this.statusHeader)
+    const responseIdIndex = headers.indexOf(this.responseIdHeader)
+
+    if (uidIndex === -1) {
+      throw new Error(`Header ${this.uidHeader} tidak ditemukan`)
+    }
+
+    const rowIndex = values.findIndex((row, i) => {
+      if (i === 0) return false
+      return String(row[uidIndex]).trim() === String(uid).trim()
     })
+
+    if (rowIndex === -1) {
+      throw new Error(`UID ${uid} tidak ditemukan`)
+    }
+
+    const record = values[rowIndex]
+    const row = rowIndex + 1
+
+    const task = record.slice(0, statusIndex + 1).map((item, i) => ({
+      label: headers[i],
+      value: item
+    }))
+
+    const status = record[statusIndex]
+    const responseId = record[responseIdIndex]
+    const approvers = record.filter(item => item && item.taskId)
+    const approver = approvers.find(item => item.status === this.pending)
+
+    return { uid, row, status, responseId, task, approvers, approver }
   }
 
   this.approve = ({ taskId, comments }) => {
-    const { task, approver, approvers, nextApprover, responseId, row, column, statusColumn } = this.getTaskById(taskId)
+    const { task, approver, approvers, nextApprover, row, column, statusColumn } = this.getTaskById(taskId)
     if (!approver) return
     approver.comments = comments
     approver.status = this.approved
@@ -1323,22 +1509,27 @@ function App() {
       nextApprover.status = this.pending
       nextApprover.timestamp = new Date()
       this.sheet.getRange(row, column + 1).setValue(JSON.stringify(nextApprover))
-      this.sendApproval({ task, approver: nextApprover, approvers, responseId })
+      this.dispatchEmailsAfterApproveAdvance({
+        taskId,
+        task,
+        nextApprover,
+        approvers
+      })
     } else {
       this.sheet.getRange(row, statusColumn).setValue(this.approved)
-      this.sendNotification(taskId)
+      this.dispatchEmailsAfterComplete(taskId, "after_approve_final")
     }
   }
 
   this.reject = ({ taskId, comments }) => {
-    const { task, approver, nextApprover, row, column, statusColumn } = this.getTaskById(taskId)
+    const { approver, row, column, statusColumn } = this.getTaskById(taskId)
     if (!approver) return
     approver.comments = comments
     approver.status = this.rejected
     approver.timestamp = new Date()
     this.sheet.getRange(row, column).setValue(JSON.stringify(approver))
     this.sheet.getRange(row, statusColumn).setValue(this.rejected)
-    this.sendNotification(taskId)
+    this.dispatchEmailsAfterComplete(taskId, "after_reject")
   }
 }
 
@@ -1360,7 +1551,6 @@ function reject({ taskId, comments }) {
 function include(filename) {
   return HtmlService.createTemplateFromFile(filename).evaluate().getContent()
 }
-
 
 function doGet(e) {
   const { taskId, responseId } = e.parameter
@@ -1402,11 +1592,38 @@ function resetUid() {
   app.resetUid()
 }
 
-/*
- * Perbaiki _response_id untuk data lama yang sudah telanjur tertukar.
- * Contoh pemakaian dari Apps Script editor:
- *   repairResponseIdByUid("MSI-04476")
- */
+function resendEmailsByUid(uid) {
+  const app = new App()
+  return app.resendEmailsByUid(uid)
+}
+
+function resendPendingApprovalByUid(uid) {
+  return resendEmailsByUid(uid)
+}
+
+function resendBulkUID() {
+  const uids = [
+    "UID1",
+    "UID2"
+  ]
+
+  return uids.map(uid => {
+    try {
+      return {
+        uid,
+        ok: true,
+        result: resendEmailsByUid(uid)
+      }
+    } catch (error) {
+      return {
+        uid,
+        ok: false,
+        error: error.message || String(error)
+      }
+    }
+  })
+}
+
 function repairResponseIdByUid(uid) {
   if (!uid) throw new Error("UID wajib diisi.")
 
@@ -1421,25 +1638,15 @@ function repairResponseIdByUid(uid) {
   const timestampColumn = headers.indexOf("Timestamp")
   const emailColumn = headers.indexOf(app.emailHeader)
 
-  if (uidColumn === -1) {
-    throw new Error('Kolom "' + app.uidHeader + '" tidak ditemukan.')
-  }
-
-  if (responseIdColumn === -1) {
-    throw new Error('Kolom "' + app.responseIdHeader + '" tidak ditemukan.')
-  }
-
-  if (timestampColumn === -1) {
-    throw new Error('Kolom "Timestamp" tidak ditemukan.')
-  }
+  if (uidColumn === -1) throw new Error('Kolom "' + app.uidHeader + '" tidak ditemukan.')
+  if (responseIdColumn === -1) throw new Error('Kolom "' + app.responseIdHeader + '" tidak ditemukan.')
+  if (timestampColumn === -1) throw new Error('Kolom "Timestamp" tidak ditemukan.')
 
   const rowIndex = displayValues.findIndex((row, index) => {
     return index > 0 && String(row[uidColumn]).trim() === String(uid).trim()
   })
 
-  if (rowIndex === -1) {
-    throw new Error("UID tidak ditemukan: " + uid)
-  }
+  if (rowIndex === -1) throw new Error("UID tidak ditemukan: " + uid)
 
   const rawTimestamp = rawValues[rowIndex][timestampColumn]
   const targetTimestamp = rawTimestamp instanceof Date
@@ -1459,7 +1666,6 @@ function repairResponseIdByUid(uid) {
 
   app.form.getResponses().forEach(response => {
     const responseTimestamp = response.getTimestamp().getTime()
-
     if (Math.abs(responseTimestamp - targetTimestamp) > 2000) return
 
     const responseEmail = app.normalizeResponseMatchValue(
@@ -1472,19 +1678,13 @@ function repairResponseIdByUid(uid) {
 
     response.getItemResponses().forEach(itemResponse => {
       const item = itemResponse.getItem()
-
       if (item.getType() === FormApp.ItemType.FILE_UPLOAD) return
 
       const columnIndex = headers.indexOf(item.getTitle())
       if (columnIndex === -1) return
 
-      const rowValue = app.normalizeResponseMatchValue(
-        displayValues[rowIndex][columnIndex]
-      )
-
-      const responseValue = app.normalizeResponseMatchValue(
-        itemResponse.getResponse()
-      )
+      const rowValue = app.normalizeResponseMatchValue(displayValues[rowIndex][columnIndex])
+      const responseValue = app.normalizeResponseMatchValue(itemResponse.getResponse())
 
       if (rowValue === responseValue) score++
     })
@@ -1496,48 +1696,27 @@ function repairResponseIdByUid(uid) {
   })
 
   if (!bestResponse) {
-    throw new Error(
-      "Form Response yang cocok tidak ditemukan untuk UID: " + uid
-    )
+    throw new Error("Form Response yang cocok tidak ditemukan untuk UID: " + uid)
   }
 
   const oldResponseId = displayValues[rowIndex][responseIdColumn]
   const newResponseId = bestResponse.getId()
 
-  app.sheet
-    .getRange(rowIndex + 1, responseIdColumn + 1)
-    .setValue(newResponseId)
-
+  app.sheet.getRange(rowIndex + 1, responseIdColumn + 1).setValue(newResponseId)
   SpreadsheetApp.flush()
-
-  const attachmentFiles = app
-    .getAttachmentEntriesByResponseId(newResponseId)
-    .map(file => ({
-      id: file.id,
-      name: file.name,
-      size: file.size,
-      url: file.url
-    }))
 
   const result = {
     uid: uid,
     sheetRow: rowIndex + 1,
     oldResponseId: oldResponseId,
     newResponseId: newResponseId,
-    matchedFields: bestScore,
-    attachmentFiles: attachmentFiles
+    matchedFields: bestScore
   }
 
   Logger.log(JSON.stringify(result, null, 2))
-
   return result
 }
 
-
-/*
- * Audit file yang akan dikirim berdasarkan baris UID, tanpa mengirim email.
- * Contoh dari editor/konsol: auditAttachmentByUid("MSI-04476")
- */
 function auditAttachmentByUid(uid) {
   if (!uid) throw new Error("UID wajib diisi.")
 
@@ -1562,40 +1741,28 @@ function auditAttachmentByUid(uid) {
     value: value
   }))
 
-  const fileFields = task.filter(field => {
-    return app.getFileUploadTitles().indexOf(field.label) !== -1
-  })
-
-  const files = app.getAttachmentEntriesFromTask(task).map(file => ({
-    id: file.id,
-    name: file.name,
-    size: file.size,
-    url: file.url,
-    source: file.source
-  }))
-
   const result = {
     uid: uid,
     sheetRow: rowIndex + 1,
-    fileUploadFields: fileFields,
-    filesThatWillBeSent: files
+    fileUploadFields: task.filter(field => app.getFileUploadTitles().indexOf(field.label) !== -1),
+    filesThatWillBeSent: app.getAttachmentEntriesFromTask(task).map(file => ({
+      id: file.id,
+      name: file.name,
+      size: file.size,
+      url: file.url,
+      source: file.source
+    }))
   }
 
   Logger.log(JSON.stringify(result, null, 2))
   return result
 }
 
-/*
- * Hapus trigger submit lama/duplikat untuk handler yang sama, lalu buat satu
- * installable trigger dari Google Form. Jalankan sekali setelah memasang V2.
- */
 function reinstallFormSubmitTrigger() {
   const handlerName = "_onFormSubmit"
 
   ScriptApp.getProjectTriggers().forEach(trigger => {
-    const isFormSubmit =
-      trigger.getEventType() === ScriptApp.EventType.ON_FORM_SUBMIT
-
+    const isFormSubmit = trigger.getEventType() === ScriptApp.EventType.ON_FORM_SUBMIT
     if (isFormSubmit || trigger.getHandlerFunction() === handlerName) {
       ScriptApp.deleteTrigger(trigger)
     }
@@ -1634,358 +1801,331 @@ function onOpen() {
   menu.addToUi()
 }
 
-/***********************
- * RESEND CONFIG
- ***********************/
-const RESEND_CFG = {
-  // Spreadsheet ID tempat responses berada
-  SPREADSHEET_ID: "1lfSJbtFPqE6TFWEHVg05Yof-CMJKrFkHXvYUxRgnHYI",
+/*
+ * WhatsApp routing (otomatis):
+ *   - Hanya WAHA terisi     → pakai WAHA saja
+ *   - Hanya Fonnte terisi   → pakai Fonnte saja
+ *   - Keduanya terisi       → WAHA primary, Fonnte backup
+ *
+ * WHATSAPP_PROVIDER (opsional):
+ *   "auto"    → deteksi otomatis (default)
+ *   "waha"    → paksa WAHA saja (abaikan Fonnte)
+ *   "fonnte"  → paksa Fonnte saja (abaikan WAHA)
+ *
+ * Script Properties:
+ *   WHATSAPP_ENABLED, WHATSAPP_PROVIDER
+ *   WAHA_BASE_URL, WAHA_API_KEY, WAHA_SESSION, FONNTE_TOKEN
+ */
+function getWhatsAppSettings() {
+  const props = PropertiesService.getScriptProperties()
 
-  // Nama tab responses
-  SHEET_NAME: "Form Responses 4",
+  return {
+    enabled: String(props.getProperty("WHATSAPP_ENABLED") || "true").toLowerCase() !== "false",
+    provider: String(props.getProperty("WHATSAPP_PROVIDER") || "auto").toLowerCase().trim()
+  }
+}
 
-  // WebApp URL untuk link approve
-  WEBAPP_URL_EMAIL: "https://script.google.com/macros/s/AKfycbzxG526rFp_8MRG2k4ExRYO8PETLs3xC1AhboLn5TUOxoiqs6bG1DnXjzKiUnJja1Tu/exec"
-};
+function isWahaConfigured() {
+  return !!getWahaConfig().baseUrl
+}
 
+function isFonnteConfigured() {
+  return !!getFonnteConfig().token
+}
 
-/***********************
- * SHEET HELPER
- ***********************/
-function getResponsesSheetSafe_() {
-  const ss = SpreadsheetApp.openById(RESEND_CFG.SPREADSHEET_ID);
-  const sheet = ss.getSheetByName(RESEND_CFG.SHEET_NAME);
+function resolveWhatsAppRouting() {
+  const settings = getWhatsAppSettings()
 
-  if (!sheet) {
-    throw new Error(
-      'Sheet "' + RESEND_CFG.SHEET_NAME + '" tidak ditemukan di Spreadsheet ID: ' +
-      RESEND_CFG.SPREADSHEET_ID
-    );
+  if (!settings.enabled) {
+    return { mode: "disabled", primary: null, backup: null }
   }
 
-  return sheet;
+  const wahaReady = isWahaConfigured()
+  const fonnteReady = isFonnteConfigured()
+  const forced = settings.provider
+
+  if (forced === "waha") {
+    return { mode: "single", primary: "waha", backup: null, forced: true }
+  }
+
+  if (forced === "fonnte") {
+    return { mode: "single", primary: "fonnte", backup: null, forced: true }
+  }
+
+  if (wahaReady && fonnteReady) {
+    return { mode: "dual", primary: "waha", backup: "fonnte", forced: false }
+  }
+
+  if (wahaReady) {
+    return { mode: "single", primary: "waha", backup: null, forced: false }
+  }
+
+  if (fonnteReady) {
+    return { mode: "single", primary: "fonnte", backup: null, forced: false }
+  }
+
+  return { mode: "none", primary: null, backup: null, forced: false }
 }
 
+function sendWhatsAppViaProvider(provider, phoneNumber, message) {
+  if (provider === "waha") {
+    return sendWhatsAppViaWaha(phoneNumber, message)
+  }
 
-/***********************
- * PARSE SHEET VALUES
- ***********************/
-function getParsedSheetValues_(sheet) {
-  const values = sheet.getDataRange().getDisplayValues();
+  if (provider === "fonnte") {
+    return sendWhatsAppViaFonnte(phoneNumber, message)
+  }
 
-  return values.map(row => {
-    return row.map(cell => {
-      try {
-        return JSON.parse(cell);
-      } catch (e) {
-        return cell;
-      }
-    });
-  });
+  return { ok: false, skipped: true, reason: "unknown_provider", provider: provider }
 }
 
+function getWahaConfig() {
+  const props = PropertiesService.getScriptProperties()
 
-/***********************
- * BUILD INDEX FROM SHEET
- ***********************/
-function buildIndexFromSheet_(sheet) {
-  const values = getParsedSheetValues_(sheet);
-  const headers = values[0];
+  return {
+    baseUrl: String(props.getProperty("WAHA_BASE_URL") || "").replace(/\/$/, ""),
+    apiKey: props.getProperty("WAHA_API_KEY") || "",
+    session: props.getProperty("WAHA_SESSION") || "default"
+  }
+}
 
-  const uidCol = headers.indexOf("_uid");
-  const statusCol = headers.indexOf("_status");
-  const responseIdCol = headers.indexOf("_response_id");
-  const emailCol = headers.indexOf("Email Address");
+function getFonnteConfig() {
+  const props = PropertiesService.getScriptProperties()
 
-  if (uidCol === -1) throw new Error('Kolom "_uid" tidak ditemukan.');
-  if (statusCol === -1) throw new Error('Kolom "_status" tidak ditemukan.');
-  if (responseIdCol === -1) throw new Error('Kolom "_response_id" tidak ditemukan.');
+  return {
+    token: props.getProperty("FONNTE_TOKEN") || ""
+  }
+}
 
-  const uidToRowIndex = new Map();
+function normalizePhoneForWhatsApp(phone) {
+  if (phone == null || phone === "") return null
 
-  for (let i = 1; i < values.length; i++) {
-    const uid = values[i][uidCol];
-    if (uid) {
-      uidToRowIndex.set(uid, i);
+  let digits = String(phone).replace(/[^\d]/g, "")
+  if (!digits || digits.length < 9) return null
+
+  if (digits.startsWith("0")) {
+    digits = "62" + digits.slice(1)
+  }
+
+  if (!digits.startsWith("62") && digits.length >= 9 && digits.length <= 12) {
+    digits = "62" + digits
+  }
+
+  if (digits.length < 11 || digits.length > 15) return null
+
+  return digits
+}
+
+function normalizePhoneForWaha(phone) {
+  return normalizePhoneForWhatsApp(phone)
+}
+
+function sendWhatsAppViaWaha(phoneNumber, message) {
+  const cfg = getWahaConfig()
+
+  if (!cfg.baseUrl) {
+    return { ok: false, skipped: true, reason: "waha_base_url_missing", provider: "waha" }
+  }
+
+  const chatId = phoneNumber + "@c.us"
+  const url = cfg.baseUrl + "/api/sendText"
+  const payload = {
+    session: cfg.session,
+    chatId: chatId,
+    text: message
+  }
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  }
+
+  if (cfg.apiKey) {
+    options.headers = { "X-Api-Key": cfg.apiKey }
+  }
+
+  try {
+    const response = UrlFetchApp.fetch(url, options)
+    const statusCode = response.getResponseCode()
+    const body = response.getContentText()
+
+    if (statusCode >= 200 && statusCode < 300) {
+      Logger.log(`[WAHA OK] ${phoneNumber}: ${body}`)
+      return { ok: true, provider: "waha", phone: phoneNumber, chatId: chatId, response: body }
     }
+
+    Logger.log(`[WAHA FAIL] ${phoneNumber} HTTP ${statusCode}: ${body}`)
+    return { ok: false, provider: "waha", error: `HTTP ${statusCode}: ${body}` }
+  } catch (error) {
+    const errMsg = error && error.message ? error.message : String(error)
+    Logger.log(`[WAHA FAIL] ${phoneNumber}: ${errMsg}`)
+    return { ok: false, provider: "waha", error: errMsg }
+  }
+}
+
+function sendWhatsAppViaFonnte(phoneNumber, message) {
+  const cfg = getFonnteConfig()
+
+  if (!cfg.token) {
+    return { ok: false, skipped: true, reason: "fonnte_token_missing", provider: "fonnte" }
+  }
+
+  const options = {
+    method: "post",
+    headers: {
+      Authorization: cfg.token
+    },
+    payload: {
+      target: phoneNumber,
+      message: message
+    },
+    muteHttpExceptions: true
+  }
+
+  try {
+    const response = UrlFetchApp.fetch("https://api.fonnte.com/send", options)
+    const statusCode = response.getResponseCode()
+    const body = response.getContentText()
+
+    if (statusCode >= 200 && statusCode < 300) {
+      Logger.log(`[FONNTE OK] ${phoneNumber}: ${body}`)
+      return { ok: true, provider: "fonnte", phone: phoneNumber, response: body }
+    }
+
+    Logger.log(`[FONNTE FAIL] ${phoneNumber} HTTP ${statusCode}: ${body}`)
+    return { ok: false, provider: "fonnte", error: `HTTP ${statusCode}: ${body}` }
+  } catch (error) {
+    const errMsg = error && error.message ? error.message : String(error)
+    Logger.log(`[FONNTE FAIL] ${phoneNumber}: ${errMsg}`)
+    return { ok: false, provider: "fonnte", error: errMsg }
+  }
+}
+
+function sendWhatsApp(phoneNumber, message) {
+  const routing = resolveWhatsAppRouting()
+
+  if (routing.mode === "disabled") {
+    return { ok: false, skipped: true, reason: "whatsapp_disabled", routing: routing }
+  }
+
+  if (routing.mode === "none") {
+    Logger.log("[WhatsApp SKIP] Tidak ada provider yang dikonfigurasi (WAHA/Fonnte kosong)")
+    return { ok: false, skipped: true, reason: "whatsapp_not_configured", routing: routing }
+  }
+
+  const primaryResult = sendWhatsAppViaProvider(routing.primary, phoneNumber, message)
+
+  if (primaryResult.ok || routing.mode !== "dual") {
+    return Object.assign({}, primaryResult, { routing: routing })
+  }
+
+  Logger.log(
+    `[WhatsApp] ${routing.primary} gagal, fallback ke ${routing.backup} untuk ${phoneNumber}`
+  )
+
+  const backupResult = sendWhatsAppViaProvider(routing.backup, phoneNumber, message)
+
+  if (backupResult.ok) {
+    return Object.assign({}, backupResult, {
+      routing: routing,
+      fallbackFrom: routing.primary,
+      primaryAttempt: primaryResult
+    })
   }
 
   return {
-    values,
-    headers,
-    uidCol,
-    statusCol,
-    responseIdCol,
-    emailCol,
-    uidToRowIndex
-  };
+    ok: false,
+    routing: routing,
+    error: "WAHA dan Fonnte gagal",
+    primary: primaryResult,
+    backup: backupResult
+  }
 }
 
+function setupWhatsAppProperties(config) {
+  config = config || {}
+  const waha = config.waha || {}
+  const fonnte = config.fonnte || {}
+  const props = PropertiesService.getScriptProperties()
+  const values = {}
 
-/***********************
- * EXTRACT TASK + APPROVERS
- ***********************/
-function extractTaskAndApproversFromRow_({
-  row,
-  headers,
-  statusCol,
-  responseIdCol,
-  emailCol
-}) {
-  const task = row.slice(0, statusCol + 1).map((item, i) => {
-    return {
-      label: headers[i],
-      value: item
-    };
-  });
-
-  const approvers = row.filter(item => {
-    return item && typeof item === "object" && item.taskId;
-  });
-
-  const pendingApprovers = approvers.filter(approver => {
-    return approver.status === "Pending";
-  });
-
-  return {
-    task,
-    approvers,
-    pendingApprovers,
-    responseId: row[responseIdCol],
-    requesterEmail: emailCol >= 0 ? row[emailCol] : ""
-  };
-}
-
-
-/***********************
- * SEND RESEND APPROVAL
- ***********************/
-function sendResendApprovalEmail_({
-  app,
-  task,
-  approver,
-  approvers,
-  responseId,
-  webAppUrl
-}) {
-  const template =
-    HtmlService.createTemplateFromFile("approval_email.html")
-
-  template.title = app.title
-  template.task = task
-  template.approver = approver
-  template.approvers = approvers
-  template.actionUrl =
-    `${webAppUrl}?taskId=${approver.taskId}`
-  template.formUrl = app.formUrl
-
-  template.approved = app.approved
-  template.rejected = app.rejected
-  template.pending = app.pending
-  template.waiting = app.waiting
-
-  const subject =
-    "Approval Required - " + app.title
-
-  const attachmentPayload =
-    app.prepareEmailAttachmentsFromTask(task)
-
-  return app.sendEmailWithAttachmentFallback({
-    recipient: approver.email,
-    subject: subject,
-    baseHtmlBody: template.evaluate().getContent(),
-    attachmentPayload: attachmentPayload
-  })
-}
-
-
-/***********************
- * RESEND APPROVAL + PENGAJU
- ***********************/
-function resendPendingApprovals_Email(uids, webAppUrl) {
-  uids = Array.isArray(uids) ? uids : []
-
-  webAppUrl =
-    webAppUrl || RESEND_CFG.WEBAPP_URL_EMAIL
-
-  if (!uids.length) {
-    throw new Error(
-      'UIDS kosong. Jalankan fungsi ' +
-      '"resendPendingApprovals_MSI_Bulk_ToEmail".'
-    )
+  if (config.provider !== undefined) {
+    const provider = String(config.provider || "auto").toLowerCase().trim()
+    if (provider !== "auto" && provider !== "waha" && provider !== "fonnte") {
+      throw new Error('WHATSAPP_PROVIDER harus "auto", "waha", atau "fonnte"')
+    }
+    values.WHATSAPP_PROVIDER = provider
   }
 
-  const sheet = getResponsesSheetSafe_()
-  const app = new App()
+  if (config.enabled !== undefined) {
+    values.WHATSAPP_ENABLED = config.enabled ? "true" : "false"
+  }
 
-  const {
-    values,
-    headers,
-    statusCol,
-    responseIdCol,
-    emailCol,
-    uidToRowIndex
-  } = buildIndexFromSheet_(sheet)
+  if (waha.baseUrl !== undefined) {
+    values.WAHA_BASE_URL = String(waha.baseUrl || "").replace(/\/$/, "")
+  }
+  if (waha.apiKey !== undefined) {
+    values.WAHA_API_KEY = String(waha.apiKey || "")
+  }
+  if (waha.session !== undefined) {
+    values.WAHA_SESSION = String(waha.session || "default")
+  }
+
+  if (fonnte.token !== undefined) {
+    values.FONNTE_TOKEN = String(fonnte.token || "")
+  }
+
+  props.setProperties(values)
 
   const summary = {
-    totalUid: uids.length,
-    totalApprovalSent: 0,
-    totalRequesterSent: 0,
-    approvalOk: [],
-    requesterOk: [],
-    fail: []
+    enabled: getWhatsAppSettings().enabled,
+    providerSetting: getWhatsAppSettings().provider,
+    routing: resolveWhatsAppRouting(),
+    wahaConfigured: isWahaConfigured(),
+    fonnteConfigured: isFonnteConfigured(),
+    waha: getWahaConfig(),
+    fonnte: { tokenSet: isFonnteConfigured() }
   }
 
-  uids.forEach(uid => {
-    const rowIndex = uidToRowIndex.get(uid)
-
-    if (rowIndex == null) {
-      summary.fail.push({
-        uid: uid,
-        type: "data",
-        reason: "UID tidak ditemukan di sheet."
-      })
-
-      return
-    }
-
-    const row = values[rowIndex]
-
-    const {
-      task,
-      approvers,
-      pendingApprovers,
-      responseId,
-      requesterEmail
-    } = extractTaskAndApproversFromRow_({
-      row,
-      headers,
-      statusCol,
-      responseIdCol,
-      emailCol
-    })
-
-    if (!pendingApprovers.length) {
-      summary.fail.push({
-        uid: uid,
-        type: "approval",
-        reason: "Tidak ada approver berstatus Pending."
-      })
-
-      return
-    }
-
-    /*
-     * Kirim ulang email ke semua approver Pending.
-     */
-    pendingApprovers.forEach(approver => {
-      if (!approver.email) {
-        summary.fail.push({
-          uid: uid,
-          type: "approval",
-          approverName: approver.name || "",
-          reason: "Email approver kosong."
-        })
-
-        return
-      }
-
-      try {
-        const result = sendResendApprovalEmail_({
-          app,
-          task,
-          approver,
-          approvers,
-          responseId,
-          webAppUrl
-        })
-
-        summary.approvalOk.push({
-          uid: uid,
-          approverName: approver.name || "",
-          sentTo: approver.email,
-          attachedFiles: result.attachedFiles,
-          linkedFiles: result.linkedFiles,
-          fileNames: result.fileNames,
-          fileIds: result.fileIds,
-          attachmentSource: result.attachmentSource,
-          fallbackToLinks: result.fallbackToLinks
-        })
-
-        summary.totalApprovalSent++
-      } catch (error) {
-        summary.fail.push({
-          uid: uid,
-          type: "approval",
-          approverName: approver.name || "",
-          approverEmail: approver.email || "",
-          reason: error && error.message
-            ? error.message
-            : String(error)
-        })
-      }
-    })
-
-    /*
-     * Kirim ulang notifikasi status Pending ke pengaju.
-     * Cukup satu kali per UID, bukan satu kali per approver.
-     */
-    try {
-      if (!requesterEmail) {
-        throw new Error(
-          'Kolom "Email Address" pengaju kosong.'
-        )
-      }
-
-      const pendingTaskId =
-        pendingApprovers[0].taskId
-
-      const result =
-        app.sendNotification(pendingTaskId)
-
-      summary.requesterOk.push({
-        uid: uid,
-        sentTo: requesterEmail,
-        status: "Pending",
-        attachedFiles: result.attachedFiles,
-        linkedFiles: result.linkedFiles,
-        fileNames: result.fileNames,
-        fileIds: result.fileIds,
-        attachmentSource: result.attachmentSource,
-        fallbackToLinks: result.fallbackToLinks
-      })
-
-      summary.totalRequesterSent++
-    } catch (error) {
-      summary.fail.push({
-        uid: uid,
-        type: "requester",
-        requesterEmail: requesterEmail || "",
-        reason: error && error.message
-          ? error.message
-          : String(error)
-      })
-    }
-  })
-
-  Logger.log(
-    "========== RESEND APPROVAL + REQUESTER SUMMARY =========="
-  )
-
-  Logger.log(
-    JSON.stringify(summary, null, 2)
-  )
-
+  Logger.log("WhatsApp properties tersimpan: " + JSON.stringify(summary, null, 2))
   return summary
 }
 
-function resendPendingApprovals_MSI_Bulk_ToEmail() {
-  const UIDS = [
-    "MSI-04476"
-  ];
+function setupWahaProperties(baseUrl, apiKey, session) {
+  return setupWhatsAppProperties({
+    provider: "auto",
+    enabled: true,
+    waha: {
+      baseUrl: baseUrl,
+      apiKey: apiKey,
+      session: session
+    }
+  })
+}
 
-  return resendPendingApprovals_Email(
-    UIDS,
-    RESEND_CFG.WEBAPP_URL_EMAIL
-  );
+function setupFonnteProperties(token) {
+  return setupWhatsAppProperties({
+    provider: "auto",
+    enabled: true,
+    fonnte: {
+      token: token
+    }
+  })
+}
+
+function setupWhatsAppDualProperties(wahaBaseUrl, wahaApiKey, wahaSession, fonnteToken) {
+  return setupWhatsAppProperties({
+    provider: "auto",
+    enabled: true,
+    waha: {
+      baseUrl: wahaBaseUrl,
+      apiKey: wahaApiKey,
+      session: wahaSession
+    },
+    fonnte: {
+      token: fonnteToken
+    }
+  })
 }

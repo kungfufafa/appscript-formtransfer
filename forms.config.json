@@ -1,0 +1,66 @@
+{
+  "mechanismVersion": "2.7.0",
+  "whatsapp": {
+    "mode": "auto_routing",
+    "rules": {
+      "wahaOnly": "Hanya WAHA_BASE_URL terisi → WAHA saja",
+      "fonnteOnly": "Hanya FONNTE_TOKEN terisi → Fonnte saja",
+      "both": "Keduanya terisi → WAHA primary, Fonnte backup",
+      "forced": "WHATSAPP_PROVIDER=waha|fonnte → paksa single provider"
+    },
+    "allowedProviders": ["auto", "waha", "fonnte"],
+    "propertyKeys": [
+      "WHATSAPP_ENABLED",
+      "WHATSAPP_PROVIDER",
+      "WAHA_BASE_URL",
+      "WAHA_API_KEY",
+      "WAHA_SESSION",
+      "FONNTE_TOKEN"
+    ]
+  },
+  "waha": {
+    "setupNote": "Jalankan setupWahaProperties(baseUrl, apiKey, session) sekali di setiap project Apps Script",
+    "propertyKeys": [
+      "WAHA_BASE_URL",
+      "WAHA_API_KEY",
+      "WAHA_SESSION"
+    ],
+    "defaultSession": "default",
+    "sendEndpoint": "/api/sendText"
+  },
+  "fonnte": {
+    "sendEndpoint": "https://api.fonnte.com/send"
+  },
+  "forms": {
+    "online.gs": {
+      "url": "https://script.google.com/macros/s/AKfycbw3yM5fX48ViXK0lmIKsUREDQ4H_C84jJiuVf0qtIVbrIBdLudibWqB2cwzF-LMpFNu/exec",
+      "sheetname": "Form Responses 2",
+      "uidPrefix": "OL-"
+    },
+    "rism.gs": {
+      "url": "https://script.google.com/macros/s/AKfycbwVpRSxcBFHq3N_bv1L_rCDRkWfU0Gke9oeRd2OuSH-Bg_0Y__VoLt-AVnk5dxekcFQKw/exec",
+      "sheetname": "Form Responses 10",
+      "uidPrefix": "RISM-"
+    },
+    "cvtop.gs": {
+      "url": "https://script.google.com/macros/s/AKfycbwKiet7gVLphsJemBkxaXx1Hkd3Td7JGPO3ywx8FTgvv8fqOnuoXUzXR7uNkKkTznMQDQ/exec",
+      "sheetname": "Form Responses 1",
+      "uidPrefix": "UID-"
+    },
+    "smi.gs": {
+      "url": "https://script.google.com/macros/s/AKfycbxXiRMNvukuJDB4t8m9uMP365X7mgj2LmonbpmP0L_mBCMXnUCIT-bz9_0N1kdjggW5/exec",
+      "sheetname": "Form Responses 1",
+      "uidPrefix": "SMI-"
+    },
+    "msi.gs": {
+      "url": "https://script.google.com/macros/s/AKfycbzxG526rFp_8MRG2k4ExRYO8PETLs3xC1AhboLn5TUOxoiqs6bG1DnXjzKiUnJja1Tu/exec",
+      "sheetname": "Form Responses 4",
+      "uidPrefix": "MSI-"
+    },
+    "cvcs.gs": {
+      "url": "https://script.google.com/macros/s/AKfycbweg4HtlqY9z4tGMZMadfd-IKLdLncIH2BIkiN_cX0960HUSJe3-69nAfBoAosS9w0r/exec",
+      "sheetname": "Form Responses 3",
+      "uidPrefix": "CS-"
+    }
+  }
+}
